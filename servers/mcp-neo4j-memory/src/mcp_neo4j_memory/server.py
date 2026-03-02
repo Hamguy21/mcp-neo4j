@@ -1,6 +1,6 @@
 import json
 import logging
-from typing import Literal
+from typing import Literal, Optional
 
 from neo4j import AsyncGraphDatabase
 from pydantic import Field
@@ -15,15 +15,22 @@ from mcp.types import TextContent
 from neo4j.exceptions import Neo4jError
 from mcp.types import ToolAnnotations
 
-from .neo4j_memory import Neo4jMemory, Entity, Relation, ObservationAddition, ObservationDeletion, KnowledgeGraph
+from .neo4j_memory import (
+    Neo4jMemory,
+    Entity,
+    Relation,
+    ObservationAddition,
+    ObservationDeletion,
+    KnowledgeGraph,
+    ConversationChunk,
+    ConversationExport,
+    calculate_tokens,
+)
 from .utils import format_namespace
 
 # Set up logging
 logger = logging.getLogger('mcp_neo4j_memory')
 logger.setLevel(logging.INFO)
-
-
-
 
 
 def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
@@ -403,6 +410,338 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
         except Exception as e:
             logger.error(f"Error finding memories by name: {e}")
             raise ToolError(f"Error finding memories by name: {e}")
+
+    # -------------------------------------------------------------------------
+    # New context-management tools
+    # -------------------------------------------------------------------------
+
+    @mcp.tool(
+        name=namespace_prefix + "get_recent_chunks",
+        annotations=ToolAnnotations(
+            title="Get Recent Chunks",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def get_recent_chunks(
+        conv_id: str = Field(..., description="Conversation ID to retrieve chunks from"),
+        limit: int = Field(10, description="Maximum number of recent chunks to return (default 10)", ge=1, le=10000),
+    ) -> ToolResult:
+        """Return the most recent N conversation chunks in chronological order.
+        
+        Use this to quickly load only the last few turns of a conversation without
+        fetching the entire history. Helps avoid context window overflow.
+        
+        Returns:
+            list[ConversationChunk]: Chunks ordered oldest-first (chronological)
+            
+        Example call:
+        {
+            "conv_id": "session-2024-01-15",
+            "limit": 5
+        }
+        """
+        logger.info(f"MCP tool: get_recent_chunks conv_id='{conv_id}' limit={limit}")
+        try:
+            result = await memory.get_recent_chunks(conv_id, limit)
+            return ToolResult(
+                content=[TextContent(type="text", text=json.dumps([c.model_dump() for c in result]))],
+                structured_content={"result": [c.model_dump() for c in result]},
+            )
+        except Neo4jError as e:
+            logger.error(f"Neo4j error getting recent chunks: {e}")
+            raise ToolError(f"Neo4j error getting recent chunks: {e}")
+        except Exception as e:
+            logger.error(f"Error getting recent chunks: {e}")
+            raise ToolError(f"Error getting recent chunks: {e}")
+
+    @mcp.tool(
+        name=namespace_prefix + "summarize_conversation",
+        annotations=ToolAnnotations(
+            title="Summarize Conversation",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def summarize_conversation(
+        conv_id: str = Field(..., description="Conversation ID to summarize"),
+        max_input_tokens: int = Field(4000, description="Maximum tokens of conversation history to include (default 4000)", ge=100, le=100000),
+        focus: Optional[str] = Field(None, description="Optional focus hint prepended to the output, e.g. 'key decisions made'"),
+    ) -> ToolResult:
+        """Retrieve and concatenate conversation chunks up to a token limit.
+        
+        Returns the raw conversation text (up to max_input_tokens tokens) so the calling
+        LLM can summarize it. This tool does NOT call any LLM — it only fetches and
+        concatenates stored chunks. Use it when context is getting large (~6000 tokens).
+        
+        Returns:
+            str: Concatenated conversation text ready for summarization
+            
+        Example call:
+        {
+            "conv_id": "session-2024-01-15",
+            "max_input_tokens": 3000,
+            "focus": "key decisions and action items"
+        }
+        """
+        logger.info(f"MCP tool: summarize_conversation conv_id='{conv_id}'")
+        try:
+            result = await memory.summarize_conversation(conv_id, max_input_tokens, focus)
+            return ToolResult(
+                content=[TextContent(type="text", text=result)],
+                structured_content={"text": result},
+            )
+        except Neo4jError as e:
+            logger.error(f"Neo4j error summarizing conversation: {e}")
+            raise ToolError(f"Neo4j error summarizing conversation: {e}")
+        except Exception as e:
+            logger.error(f"Error summarizing conversation: {e}")
+            raise ToolError(f"Error summarizing conversation: {e}")
+
+    @mcp.tool(
+        name=namespace_prefix + "branch_conversation",
+        annotations=ToolAnnotations(
+            title="Branch Conversation",
+            readOnlyHint=False,
+            destructiveHint=False,
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
+    )
+    async def branch_conversation(
+        source_conv_id: str = Field(..., description="The existing conversation ID to branch from"),
+        new_conv_id: str = Field(..., description="The new conversation ID for the branch"),
+        carry_over_summary: str = Field(..., description="Summary text to carry over as the first chunk (chunk 0) of the new branch"),
+    ) -> ToolResult:
+        """Start a new conversation branch carrying over a summary from the old one.
+        
+        Use this when the current conversation context is full. The carry_over_summary
+        becomes chunk 0 (role='system') of the new branch, preserving key context.
+        The original conversation is not modified.
+        
+        Returns:
+            dict: Success status and the new conversation ID
+            
+        Example call:
+        {
+            "source_conv_id": "session-2024-01-15",
+            "new_conv_id": "session-2024-01-15-branch-2",
+            "carry_over_summary": "We discussed graph database design. Key decisions: use Neo4j, model users as nodes."
+        }
+        """
+        logger.info(f"MCP tool: branch_conversation '{source_conv_id}' -> '{new_conv_id}'")
+        try:
+            result = await memory.branch_conversation(source_conv_id, new_conv_id, carry_over_summary)
+            return ToolResult(
+                content=[TextContent(type="text", text=json.dumps(result))],
+                structured_content=result,
+            )
+        except Neo4jError as e:
+            logger.error(f"Neo4j error branching conversation: {e}")
+            raise ToolError(f"Neo4j error branching conversation: {e}")
+        except Exception as e:
+            logger.error(f"Error branching conversation: {e}")
+            raise ToolError(f"Error branching conversation: {e}")
+
+    @mcp.tool(
+        name=namespace_prefix + "search_by_date",
+        annotations=ToolAnnotations(
+            title="Search by Date",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def search_by_date(
+        conv_id: str = Field(..., description="Conversation ID to search within"),
+        since: str = Field(..., description="Start of time window as ISO 8601 string, e.g. '2024-01-15T00:00:00Z'"),
+        until: str = Field(..., description="End of time window as ISO 8601 string, e.g. '2024-01-15T23:59:59Z'"),
+        limit: int = Field(50, description="Maximum number of chunks to return (default 50)", ge=1, le=10000),
+    ) -> ToolResult:
+        """Find conversation chunks created within a specific time window.
+        
+        Useful for questions like "What did we discuss last week?" or "Show me everything
+        since yesterday." Both since and until are inclusive ISO 8601 timestamps.
+        
+        Returns:
+            list[ConversationChunk]: Matching chunks ordered by timestamp ascending
+            
+        Example call:
+        {
+            "conv_id": "session-2024-01-15",
+            "since": "2024-01-15T09:00:00Z",
+            "until": "2024-01-15T17:00:00Z"
+        }
+        """
+        logger.info(f"MCP tool: search_by_date conv_id='{conv_id}' since='{since}' until='{until}'")
+        try:
+            result = await memory.search_by_date(conv_id, since, until, limit)
+            return ToolResult(
+                content=[TextContent(type="text", text=json.dumps([c.model_dump() for c in result]))],
+                structured_content={"result": [c.model_dump() for c in result]},
+            )
+        except Neo4jError as e:
+            logger.error(f"Neo4j error searching by date: {e}")
+            raise ToolError(f"Neo4j error searching by date: {e}")
+        except Exception as e:
+            logger.error(f"Error searching by date: {e}")
+            raise ToolError(f"Error searching by date: {e}")
+
+    @mcp.tool(
+        name=namespace_prefix + "export_conversation_json",
+        annotations=ToolAnnotations(
+            title="Export Conversation JSON",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=True,
+        ),
+    )
+    async def export_conversation_json(
+        conv_id: str = Field(..., description="Conversation ID to export"),
+        include_embeddings: bool = Field(False, description="Whether to include embedding vectors (default false — not yet implemented, reserved for future use)"),
+    ) -> ToolResult:
+        """Export a conversation and the full knowledge graph as clean JSON.
+        
+        Returns all conversation chunks plus all Memory entities and relations.
+        Useful for backup, debugging, moving to another system, or offline analysis.
+        
+        Returns:
+            ConversationExport: JSON object with conv_id, chunks, entities, relations
+            
+        Example call:
+        {
+            "conv_id": "session-2024-01-15"
+        }
+        """
+        logger.info(f"MCP tool: export_conversation_json conv_id='{conv_id}'")
+        try:
+            result = await memory.export_conversation_json(conv_id, include_embeddings)
+            return ToolResult(
+                content=[TextContent(type="text", text=result.model_dump_json())],
+                structured_content=result,
+            )
+        except Neo4jError as e:
+            logger.error(f"Neo4j error exporting conversation: {e}")
+            raise ToolError(f"Neo4j error exporting conversation: {e}")
+        except Exception as e:
+            logger.error(f"Error exporting conversation: {e}")
+            raise ToolError(f"Error exporting conversation: {e}")
+
+    @mcp.tool(
+        name=namespace_prefix + "prune_old_chunks",
+        annotations=ToolAnnotations(
+            title="Prune Old Chunks",
+            readOnlyHint=False,
+            destructiveHint=True,
+            idempotentHint=False,
+            openWorldHint=True,
+        ),
+    )
+    async def prune_old_chunks(
+        conv_id: str = Field(..., description="Conversation ID whose chunks should be pruned"),
+        keep_last_n: Optional[int] = Field(None, description="Keep only the N most recent chunks; delete the rest", ge=0),
+        older_than_days: Optional[int] = Field(None, description="Delete chunks older than this many days", ge=0),
+    ) -> ToolResult:
+        """Delete old conversation chunks to prevent the database from growing forever.
+        
+        Provide keep_last_n to keep only the most recent N chunks, or older_than_days
+        to delete chunks older than that many days. Both can be provided simultaneously
+        (both conditions are applied independently).
+        
+        WARNING: This permanently deletes chunks and cannot be undone.
+        
+        Returns:
+            dict: Success status and number of chunks deleted
+            
+        Example call — keep only last 20 chunks:
+        {
+            "conv_id": "session-2024-01-15",
+            "keep_last_n": 20
+        }
+        
+        Example call — delete chunks older than 30 days:
+        {
+            "conv_id": "session-2024-01-15",
+            "older_than_days": 30
+        }
+        """
+        logger.info(f"MCP tool: prune_old_chunks conv_id='{conv_id}' keep_last_n={keep_last_n} older_than_days={older_than_days}")
+        if keep_last_n is None and older_than_days is None:
+            raise ToolError("At least one of keep_last_n or older_than_days must be provided.")
+        try:
+            result = await memory.prune_old_chunks(conv_id, keep_last_n, older_than_days)
+            return ToolResult(
+                content=[TextContent(type="text", text=json.dumps(result))],
+                structured_content=result,
+            )
+        except Neo4jError as e:
+            logger.error(f"Neo4j error pruning chunks: {e}")
+            raise ToolError(f"Neo4j error pruning chunks: {e}")
+        except Exception as e:
+            logger.error(f"Error pruning chunks: {e}")
+            raise ToolError(f"Error pruning chunks: {e}")
+
+    @mcp.tool(
+        name=namespace_prefix + "calculate_tokens",
+        annotations=ToolAnnotations(
+            title="Calculate Tokens",
+            readOnlyHint=True,
+            destructiveHint=False,
+            idempotentHint=True,
+            openWorldHint=False,
+        ),
+    )
+    async def calculate_tokens_tool(
+        text: str = Field(..., description="The text to count tokens for"),
+        encoding: str = Field("cl100k_base", description="Tiktoken encoding to use (default 'cl100k_base', compatible with GPT-4 and most modern models)"),
+    ) -> ToolResult:
+        """Count how many tokens a piece of text uses — proactively check 'am I about to overflow?'
+        
+        PRIMARY USE CASE: Call this tool on the current conversation history or prompt to measure
+        its token length. If token_count is approaching your model's context limit, call
+        summarize_conversation to compress old turns, then branch_conversation to start fresh.
+        This prevents context window freeze / overflow without losing important information.
+        
+        Recommended overflow-prevention workflow:
+        1. calculate_tokens(current_history) → check token_count
+        2. If token_count > ~6000 (for an 8k model): call summarize_conversation
+        3. Then call branch_conversation with the summary to start a fresh context window
+        
+        Uses tiktoken locally — no network call, instant result.
+        
+        Returns:
+            dict: token_count (int), encoding (str), character_count (int), approx_cost_note (str)
+            
+        Example call:
+        {
+            "text": "Hello, how are you today?",
+            "encoding": "cl100k_base"
+        }
+        
+        Example response:
+        {
+            "token_count": 7,
+            "encoding": "cl100k_base",
+            "character_count": 26,
+            "approx_cost_note": "Token count only; cost depends on your model/provider."
+        }
+        """
+        logger.info(f"MCP tool: calculate_tokens (encoding='{encoding}', text_len={len(text)})")
+        try:
+            result = calculate_tokens(text, encoding)
+            return ToolResult(
+                content=[TextContent(type="text", text=json.dumps(result))],
+                structured_content=result,
+            )
+        except Exception as e:
+            logger.error(f"Error calculating tokens: {e}")
+            raise ToolError(f"Error calculating tokens: {e}")
 
     return mcp
 
