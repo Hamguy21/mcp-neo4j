@@ -771,13 +771,12 @@ async def main(
     
     # Verify connection
     try:
-        await neo4j_driver.verify_connectivity()
-        logger.info(f"Connected to Neo4j at {neo4j_uri}")
-    except Exception as e:
-        logger.error(f"Failed to connect to Neo4j: {e}")
-    finally:
-        await neo4j_driver.close()
-        exit(1)
+    await neo4j_driver.verify_connectivity()
+    logger.info(f"Connected to Neo4j at {neo4j_uri}")
+except Exception as e:
+    logger.error(f"Failed to connect to Neo4j: {e}")
+    await neo4j_driver.close()
+    exit(1)
 
     # Initialize memory
     memory = Neo4jMemory(neo4j_driver)
