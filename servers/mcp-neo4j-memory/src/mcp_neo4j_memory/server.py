@@ -697,7 +697,7 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
             openWorldHint=False,
         ),
     )
-    async def calculate_tokens_tool(
+    async def calculate_tokens(
         text: str = Field(..., description="The text to count tokens for"),
         encoding: str = Field("cl100k_base", description="Tiktoken encoding to use (default 'cl100k_base', compatible with GPT-4 and most modern models)"),
     ) -> ToolResult:
@@ -775,6 +775,8 @@ async def main(
         logger.info(f"Connected to Neo4j at {neo4j_uri}")
     except Exception as e:
         logger.error(f"Failed to connect to Neo4j: {e}")
+    finally:
+        await neo4j_driver.close()
         exit(1)
 
     # Initialize memory
