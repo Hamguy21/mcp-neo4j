@@ -189,3 +189,81 @@ def process_config(args: argparse.Namespace) -> dict[str, Union[str, int, None]]
             config["namespace"] = ""
     
     return config
+
+async def read_recent_chunks(self, conv_id: str, limit: int = 10) -> list[dict]:
+        query = """
+        MATCH (c:Conversation {id: $conv_id})-[:HAS_CHUNK]->(chk:Chunk)
+        RETURN chk.number AS number, chk.content AS content, chk.created AS created
+        ORDER BY chk.number DESC
+        LIMIT $limit
+        """
+        result = await self.driver.execute_query(query, conv_id=conv_id, limit=limit, database_=self.database)
+        return [{"number": r["number"], "content": r["content"], "created": r["created"]} for r in result.records]
+
+    async def create_conversation(self, conv_id: str):
+        query = """
+        MERGE (c:Conversation {id: $conv_id})
+        SET c.created = datetime()
+        """
+        await self.driver.execute_query(query, conv_id=conv_id, database_=self.database)
+
+    async def add_chunk(self, conv_id: str, content: str, is_summary: bool = False):
+        query = """
+        MATCH (c:Conversation {id: $conv_id})
+        WITH c, coalesce((MATCH (c)-[:HAS_CHUNK]->(last:Chunk) RETURN max(last.number) + 1), 1) AS nextNum
+        CREATE (chk:Chunk {
+            uuid: randomUUID(),
+            conv_id: $conv_id,
+            number: nextNum,
+            content: $content,
+            token_count: size($content) / 4,  // rough estimate
+            created: datetime(),
+            is_summary: $is_summary
+        })
+        MERGE (c)-[:HAS_CHUNK]->(chk)
+        """
+        await self.driver.execute_query(query, conv_id=conv_id, content=content, is_summary=is_summary, database_=self.database)
+
+    async def search_by_date(self, conv_id: str, since: str = None, until: str = None, limit: int = 10) -> list[dict]:
+        query = """
+        MATCH (c:Conversation {id: $conv_id})-[:HAS_CHUNK]->(chk:Chunk)
+        WHERE ($since IS NULL OR chk.created >= $since)
+          AND ($until IS NULL OR chk.created <= $until)
+        RETURN chk.number, chk.content, chk.created
+        ORDER BY chk.created DESC
+        LIMIT $limit
+        """
+        result = await self.driver.execute_query(query, conv_id=conv_id, since=since, until=until, limit=limit, database_=self.database)
+        return [{"number": r["chk.number"], "content": r["chk.content"], "created": r["chk.created"]} for r in result.records]
+
+    async def export_conversation(self, conv_id: str, include_embeddings: bool = False) -> dict:
+        query = """
+        MATCH (c:Conversation {id: $conv_id})-[:HAS_CHUNK]->(chk:Chunk)
+        RETURN c.id AS conversation_id,
+               collect({
+                   number: chk.number,
+                   content: chk.content,
+                   created: chk.created,
+                   token_count: chk.token_count
+                   // embedding: chk.embedding  // uncomment if you want it
+               }) AS chunks
+        """
+        result = await self.driver.execute_query(query, conv_id=conv_id, database_=self.database)
+        if not result.records:
+            return {"conversation_id": conv_id, "chunks": []}
+        return result.records[0]
+
+    async def prune_old_chunks(self, conv_id: str, keep_last_n: int = None, older_than_days: int = None) -> int:
+        if not keep_last_n and not older_than_days:
+            raise ValueError("Must specify keep_last_n or older_than_days")
+
+        query = """
+        MATCH (c:Conversation {id: $conv_id})-[:HAS_CHUNK]->(chk:Chunk)
+        WITH c, chk, row_number() OVER (ORDER BY chk.number DESC) AS rn
+        WHERE ($keep_last_n IS NULL OR rn > $keep_last_n)
+           OR ($older_than_days IS NULL OR chk.created < datetime() - duration('P' + toString($older_than_days) + 'D'))
+        DETACH DELETE chk
+        RETURN count(chk) AS deleted
+        """
+        result = await self.driver.execute_query(query, conv_id=conv_id, keep_last_n=keep_last_n, older_than_days=older_than_days, database_=self.database)
+        return result.single()["deleted"] or 0
