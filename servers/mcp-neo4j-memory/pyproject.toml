@@ -9,6 +9,7 @@ dependencies = [
     "neo4j>=5.26.0",
     "pydantic>=2.10.1",
     "starlette>=0.28.0",
+    "tiktoken>=0.7.0",
 ]
 
 [build-system]
