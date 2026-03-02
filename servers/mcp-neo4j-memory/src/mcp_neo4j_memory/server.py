@@ -3,7 +3,7 @@ import logging
 from typing import Literal, Optional
 
 from neo4j import AsyncGraphDatabase
-from pydantic import Field
+from pydantic import Field 
 from starlette.middleware import Middleware
 from starlette.middleware.cors import CORSMiddleware
 from starlette.middleware.trustedhost import TrustedHostMiddleware
@@ -770,7 +770,7 @@ async def main(
     )
     
     # Verify connection
-    try:
+try:
     await neo4j_driver.verify_connectivity()
     logger.info(f"Connected to Neo4j at {neo4j_uri}")
 except Exception as e:
