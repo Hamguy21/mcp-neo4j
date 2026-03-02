@@ -1,6 +1,7 @@
 import json
 import logging
 from typing import Literal
+from datetime import datetime
 
 from neo4j import AsyncGraphDatabase
 from pydantic import Field
@@ -18,11 +19,13 @@ from mcp.types import ToolAnnotations
 from .neo4j_memory import Neo4jMemory, Entity, Relation, ObservationAddition, ObservationDeletion, KnowledgeGraph
 from .utils import format_namespace
 
+import tiktoken
+
 # Set up logging
 logger = logging.getLogger('mcp_neo4j_memory')
 logger.setLevel(logging.INFO)
 
-
+ENC = tiktoken.get_encoding("cl100k_base")
 
 
 
@@ -403,6 +406,154 @@ def create_mcp_server(memory: Neo4jMemory, namespace: str = "") -> FastMCP:
         except Exception as e:
             logger.error(f"Error finding memories by name: {e}")
             raise ToolError(f"Error finding memories by name: {e}")
+
+   @mcp.tool(
+        name=namespace_prefix + "calculate_tokens",
+        annotations=ToolAnnotations(title="Calculate Tokens", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
+    async def calculate_tokens(
+        text: str = Field(..., description="Text to count tokens for"),
+        encoding: str = Field("cl100k_base", description="tiktoken encoding name")
+    ) -> ToolResult:
+        """Estimate how many tokens a piece of text would use in an LLM context window."""
+        try:
+            enc = tiktoken.get_encoding(encoding)
+            count = len(enc.encode(text))
+            return ToolResult(
+                content=[TextContent(type="text", text=f"{count} tokens")],
+                structured_content={"token_count": count, "encoding": encoding, "text_length": len(text)}
+            )
+        except Exception as e:
+            logger.error(f"Token calculation failed: {e}")
+            raise ToolError(f"Token calculation error: {e}")
+
+    @mcp.tool(
+        name=namespace_prefix + "get_recent_chunks",
+        annotations=ToolAnnotations(title="Get Recent Chunks", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
+    async def get_recent_chunks(
+        conv_id: str = Field(..., description="Conversation ID"),
+        limit: int = Field(10, description="Number of recent chunks to return", ge=1, le=100)
+    ) -> ToolResult:
+        """Retrieve the most recent N chunks from a conversation."""
+        try:
+            chunks = await memory.read_recent_chunks(conv_id, limit=limit)
+            formatted = [{"number": c["number"], "content": c["content"], "created": str(c["created"])} for c in chunks]
+            return ToolResult(
+                content=[TextContent(type="text", text=json.dumps(formatted, indent=2))],
+                structured_content={"chunks": formatted, "count": len(formatted)}
+            )
+        except Exception as e:
+            logger.error(f"Error fetching recent chunks: {e}")
+            raise ToolError(f"Error: {e}")
+
+    @mcp.tool(
+        name=namespace_prefix + "summarize_conversation",
+        annotations=ToolAnnotations(title="Summarize Conversation", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
+    async def summarize_conversation(
+        conv_id: str = Field(..., description="Conversation ID"),
+        max_input_tokens: int = Field(4000, description="Max tokens to feed into summarizer"),
+        focus: str = Field("key facts, decisions, preferences, open questions", description="Summary focus")
+    ) -> ToolResult:
+        """Generate a concise summary of recent conversation history."""
+        try:
+            chunks = await memory.read_recent_chunks(conv_id, limit=30)
+            text = "\n".join([c["content"] for c in chunks])
+            if len(ENC.encode(text)) > max_input_tokens * 4:
+                text = text[-max_input_tokens * 4:]
+
+            # Placeholder — replace with real LLM call if desired
+            summary = f"[Summary of conversation focused on {focus}]\n{text[:800]}...\n[End of summary]"
+
+            # Optionally store it
+            # await memory.add_chunk(conv_id, summary, is_summary=True)
+
+            return ToolResult(
+                content=[TextContent(type="text", text=summary)],
+                structured_content={"summary": summary, "source_chunks": len(chunks)}
+            )
+        except Exception as e:
+            logger.error(f"Summarization failed: {e}")
+            raise ToolError(f"Summarization error: {e}")
+
+    @mcp.tool(
+        name=namespace_prefix + "branch_conversation",
+        annotations=ToolAnnotations(title="Branch Conversation", readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=True))
+    async def branch_conversation(
+        source_conv_id: str = Field(..., description="Source conversation ID"),
+        new_conv_id: str = Field(..., description="New conversation ID"),
+        carry_over_summary: str = Field(..., description="Summary to carry over")
+    ) -> ToolResult:
+        """Create a new conversation branch with a carried-over summary."""
+        try:
+            await memory.create_conversation(new_conv_id)
+            await memory.add_chunk(
+                new_conv_id,
+                f"[BRANCH from {source_conv_id} at {datetime.utcnow().isoformat()}]\n{carry_over_summary}",
+                is_summary=True
+            )
+            return ToolResult(
+                content=[TextContent(type="text", text=f"Branch created: {new_conv_id}")],
+                structured_content={"new_conv_id": new_conv_id}
+            )
+        except Exception as e:
+            logger.error(f"Branching failed: {e}")
+            raise ToolError(f"Branching error: {e}")
+
+    @mcp.tool(
+        name=namespace_prefix + "search_by_date",
+        annotations=ToolAnnotations(title="Search by Date", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
+    async def search_by_date(
+        conv_id: str = Field(..., description="Conversation ID"),
+        since: str = Field(None, description="ISO datetime start (optional)"),
+        until: str = Field(None, description="ISO datetime end (optional)"),
+        limit: int = Field(10, description="Max results")
+    ) -> ToolResult:
+        """Search for chunks/entities created/updated in a time range."""
+        try:
+            chunks = await memory.search_by_date(conv_id, since, until, limit)
+            return ToolResult(
+                content=[TextContent(type="text", text=json.dumps(chunks, indent=2))],
+                structured_content={"results": chunks}
+            )
+        except Exception as e:
+            logger.error(f"Date search failed: {e}")
+            raise ToolError(f"Date search error: {e}")
+
+    @mcp.tool(
+        name=namespace_prefix + "export_conversation_json",
+        annotations=ToolAnnotations(title="Export Conversation JSON", readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True))
+    async def export_conversation_json(
+        conv_id: str = Field(..., description="Conversation ID"),
+        include_embeddings: bool = Field(False, description="Include vector embeddings")
+    ) -> ToolResult:
+        """Export the full conversation as JSON."""
+        try:
+            data = await memory.export_conversation(conv_id, include_embeddings)
+            return ToolResult(
+                content=[TextContent(type="text", text=json.dumps(data, indent=2))],
+                structured_content=data
+            )
+        except Exception as e:
+            logger.error(f"Export failed: {e}")
+            raise ToolError(f"Export error: {e}")
+
+    @mcp.tool(
+        name=namespace_prefix + "prune_old_chunks",
+        annotations=ToolAnnotations(title="Prune Old Chunks", readOnlyHint=False, destructiveHint=True, idempotentHint=True, openWorldHint=True))
+    async def prune_old_chunks(
+        conv_id: str = Field(..., description="Conversation ID"),
+        keep_last_n: int = Field(None, description="Keep only the last N chunks"),
+        older_than_days: int = Field(None, description="Delete chunks older than N days")
+    ) -> ToolResult:
+        """Delete old chunks to keep database size under control."""
+        try:
+            deleted = await memory.prune_old_chunks(conv_id, keep_last_n, older_than_days)
+            return ToolResult(
+                content=[TextContent(type="text", text=f"Deleted {deleted} old chunks")],
+                structured_content={"deleted_count": deleted}
+            )
+        except Exception as e:
+            logger.error(f"Prune failed: {e}")
+            raise ToolError(f"Prune error: {e}")
 
     return mcp
 
